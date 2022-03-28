@@ -4,7 +4,6 @@
 fairseq v0.10.2
 python-telegram-bot v13.1
 全体を依存少なくリライト
-
 """
 #from fairseq_cli import interactive as intr
 from fairseq_cli.interactive import make_batches
@@ -16,6 +15,8 @@ import math
 import re
 import difflib
 import collections
+import socket
+import pickle
 
 import numpy as np
 import copy
@@ -31,8 +32,8 @@ from fairseq.dataclass.configs import FairseqConfig
 from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 
 SEPARATOR = "[SEP]"
-SPK1 = "[SPK1]"
-SPK2 = "[SPK2]"
+SPK1 = ""
+SPK2 = ""
 hiragana = re.compile('[\u3041-\u309F，、．。？！\?\!]+')
 
 
@@ -307,7 +308,7 @@ class Favot(object):
             ret.append(sample)
         return ret
 
-    def execute(self, uttr, mode="normal"):
+    def execute(self, uttr, mode="normal", num_out=5):
         ret = self._execute(uttr, mode=mode)
         if ret is not None:
             ret_scores, ret_debug = ret
@@ -320,8 +321,9 @@ class Favot(object):
         if mode == "prefinish":
             ret_utt = ret_utt + "\nあ、すみません。そろそろ時間ですね。今日はありがとうございました。"
         self.add_contexts(SPK1, ret_utt)
-        self.logger.info(str(ret_scores.most_common(5)))
-        return ret_utt, ret_debug
+        _ret_utt, _ret_scores = zip(*ret_scores.most_common(num_out))   # add
+        self.logger.info(str(ret_scores.most_common(num_out)))
+        return _ret_utt, _ret_scores
 
     def _execute(self, uttr, **kwargs):
         mode = "normal"
@@ -556,6 +558,7 @@ class Favot(object):
 
         return ret_scores, ret_debug
 
+
     def contain_duplicate(self, hypo, mode="normal", id=-1):
         #sents = self.sent_splitter.findall(hypo)
         sents = self.sent_split(hypo)
@@ -686,6 +689,7 @@ def add_local_args(parser):
     parser.add_argument('--suppress-duplicate', action="store_true", default=False, help='suppress duplicate sentences')
     parser.add_argument('--show-nbest', default=3, type=int, help='# visible candidates')
     parser.add_argument('--starting-phrase', default="こんにちは。よろしくお願いします。", type=str, help='starting phrase')
+    parser.add_argument('--host', default=socket.gethostbyname(socket.gethostname()), type=str)
     return parser
 
 
@@ -693,21 +697,52 @@ def test(logger, parser, args, cfg):
     #distributed_utils.call_main(args, main)
     fm = FavotModel(args, logger=logger)
     favot = Favot(args, fm, logger=logger, parser=parser)
-    print(favot.execute("||init||"))
+    #print(favot.execute("||init||"))
+
+    # socket
+    host = args.host
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    client.connect((host, 40000))
+    print('connect server!')
+    context_list, prob_list = [], []
+
     while True:
-        line = input("Input > ")
-        # if line.startswith("/"):
-        if line.startswith("/reset"):
-            favot.reset()
+        try:
+            receive_data = client.recv(4096)
+            if not receive_data:
+                continue
+
+            # received response
+            receive_data = pickle.loads(receive_data)
+
+            # reset
+            if receive_data["response"] == "/start":
+                favot.reset()
+                print('NTTCS model reset!')
+                continue
+            if receive_data["response"] in ("/help", "/echo", "/log", "/reload", "/contexts"):
+                continue
+
+            print('Your Response: {}'.format(receive_data["response"]))
+            context_list.append(receive_data["response"])
+            prob_list.append(receive_data["prob"])
+
+            print('query: ', context_list[-1])
+            ret = favot.execute(context_list[-1], num_out=1)
+            if ret is None or len(ret) != 2:
+                ret = ("", "")
+            responses, ret_scores = ret
+            print(responses)
+
+            print('My Response: {}'.format(responses))
+            context_list.extend(responses)
+
+            data = {'response': responses, 'prob': 0}
+            data = pickle.dumps(data)
+            client.send(data)
+        except:
             continue
-        ret = favot.execute(line.rstrip("\n"))
-        if ret is None or len(ret) != 2:
-            continue
-        ret, ret_debug = ret
-        if ret is not None:
-            logger.info("sys_uttr: " + ret)
-            print("\n".join(ret_debug))
-            print("sys: " + ret)
 
 
 def main():
